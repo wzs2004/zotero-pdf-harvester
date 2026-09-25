@@ -38,6 +38,9 @@ class Harvester:
         self.email, self.output, self.timeout = email, output, timeout
         self.fallback_cli = shutil.which("fetchpdf") if fallback_cli == "auto" else fallback_cli
         self.core_key, self.browser_fallback = core_key, browser_fallback
+        self.elsevier_key = os.environ.get("ELSEVIER_TDM_API_KEY", os.environ.get("ELSEVIER_API_KEY", ""))
+        self.wiley_token = os.environ.get("WILEY_TDM_TOKEN", "")
+        self.springer_key = os.environ.get("SPRINGER_API_KEY", "")
         self.browser_lock = threading.Lock()
         self.ua = f"zotero-pdf-harvester/0.2 (mailto:{email})"
         output.mkdir(parents=True, exist_ok=True)
@@ -104,9 +107,25 @@ class Harvester:
             hit = self.json("https://api.crossref.org/works?" + query)["message"]["items"][0]
             actual = " ".join(hit.get("title") or [])
             a, b = set(re.findall(r"[a-z0-9]+", title.lower())), set(re.findall(r"[a-z0-9]+", actual.lower()))
-            return normalize_doi(hit.get("DOI")) if len(a & b) / max(1, len(a)) >= 0.78 else ""
+            if len(a & b) / max(1, len(a)) >= 0.78:
+                return normalize_doi(hit.get("DOI"))
         except Exception:
-            return ""
+            pass
+        # OpenAlex often retains DOI links for older repository records that
+        # Crossref title search does not rank, but use a strict token threshold.
+        try:
+            params = urllib.parse.urlencode({"search": title, "per-page": 5, "mailto": self.email})
+            for hit in self.json("https://api.openalex.org/works?" + params).get("results", []):
+                actual = str(hit.get("title") or "")
+                a = set(re.findall(r"[a-z0-9]+", title.lower()))
+                b = set(re.findall(r"[a-z0-9]+", actual.lower()))
+                if len(a & b) / max(1, len(a)) >= 0.88:
+                    doi = normalize_doi(hit.get("doi"))
+                    if doi:
+                        return doi
+        except Exception:
+            pass
+        return ""
 
     def resolvers(self, doi: str):
         quoted, found = urllib.parse.quote(doi), []
@@ -138,6 +157,38 @@ class Harvester:
             return [(x.get("URL"), "crossref") for x in d.get("link") or []
                     if "pdf" in str(x.get("content-type", "")).lower()]
 
+        def openaire():
+            # OpenAIRE aggregates institutional-repository records and exposes
+            # a fulltext URL even when Unpaywall/OpenAlex have no OA location.
+            q = urllib.parse.urlencode({"doi": doi, "format": "json", "size": 5})
+            d = self.json("https://api.openaire.eu/search/publications?" + q)
+            out = []
+            for row in d.get("response", {}).get("results", {}).get("result", []):
+                try:
+                    result = row["metadata"]["oaf:entity"]["oaf:result"]
+                    fulltext = result.get("fulltext")
+                    values = fulltext if isinstance(fulltext, list) else [fulltext]
+                    for value in values:
+                        if isinstance(value, dict):
+                            value = value.get("$") or value.get("value")
+                        if isinstance(value, str):
+                            out.append((value, "openaire"))
+                except (KeyError, TypeError):
+                    continue
+            return out
+
+        def springer():
+            if not self.springer_key or not doi.startswith(("10.1007/", "10.1186/")):
+                return []
+            q = urllib.parse.urlencode({"q": f"doi:{doi}", "api_key": self.springer_key})
+            d = self.json("https://api.springernature.com/openaccess/json?" + q)
+            out = []
+            for record in d.get("records", []):
+                for link in record.get("url", []):
+                    if isinstance(link, dict) and link.get("format") == "pdf" and link.get("value"):
+                        out.append((link["value"], "springer_tdm"))
+            return out
+
         def semantic():
             ident = urllib.parse.quote("DOI:" + doi, safe=":")
             p = (self.json(f"https://api.semanticscholar.org/graph/v1/paper/{ident}?fields=openAccessPdf")
@@ -166,7 +217,7 @@ class Harvester:
             return [(f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{x}/pdf", "ncbi_oa") for x in ids]
 
         with cf.ThreadPoolExecutor(max_workers=7) as pool:
-            futures = [pool.submit(fn) for fn in (unpaywall, openalex, europepmc, crossref, semantic, core, ncbi_oa)]
+            futures = [pool.submit(fn) for fn in (unpaywall, openalex, europepmc, crossref, openaire, springer, semantic, core, ncbi_oa)]
             for future in futures:
                 try:
                     found.extend(future.result(timeout=12))
@@ -174,6 +225,40 @@ class Harvester:
                     pass
         seen = set()
         return [(u, s) for u, s in found if u and u.startswith(("http://", "https://")) and not (u in seen or seen.add(u))]
+
+    def special_download(self, doi: str, target: Path) -> str:
+        """Use publisher TDM endpoints only with the user's own credentials."""
+        candidates = []
+        if self.elsevier_key and doi.startswith("10.1016/"):
+            candidates.append((
+                f"https://api.elsevier.com/content/article/doi/{urllib.parse.quote(doi, safe='')}",
+                {"X-ELS-APIKey": self.elsevier_key, "Accept": "application/pdf"}, "elsevier_tdm",
+            ))
+        if self.wiley_token and doi.startswith("10.1002/"):
+            candidates.append((
+                f"https://api.wiley.com/onlinelibrary/tdm/v1/articles/{urllib.parse.quote(doi, safe='')}",
+                {"Wiley-TDM-Client-Token": self.wiley_token, "Accept": "application/pdf"}, "wiley_tdm",
+            ))
+        for url, headers, source in candidates:
+            request = urllib.request.Request(url, headers={"User-Agent": self.ua, **headers})
+            part = target.with_suffix(".part")
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout, context=SSL) as response:
+                    if source == "elsevier_tdm" and "not entitled" in response.headers.get("X-ELS-Status", "").lower():
+                        continue
+                    head = response.read(8192)
+                    if not head.startswith(b"%PDF"):
+                        continue
+                    with part.open("wb") as out:
+                        out.write(head); shutil.copyfileobj(response, out, 262144)
+                if part.stat().st_size >= 8000:
+                    os.replace(part, target)
+                    return source
+            except Exception:
+                pass
+            finally:
+                part.unlink(missing_ok=True)
+        return ""
 
     def download(self, url: str, target: Path) -> bool:
         request = urllib.request.Request(url, headers={
@@ -239,6 +324,8 @@ class Harvester:
             return {"key": key, "status": "no_identifier", "title": data.get("title", "")}
         target = self.output / safe_name(doi)
         source = "cache" if target.exists() else ""
+        if not source:
+            source = self.special_download(doi, target)
         if not source:
             for url, candidate_source in self.resolvers(doi):
                 if self.download(url, target):

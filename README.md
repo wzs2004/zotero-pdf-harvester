@@ -7,7 +7,8 @@
 ## 主要功能
 
 - 直接读取一个或多个 Zotero 分类，不需要导出 CSV。
-- 并行查询 Unpaywall、OpenAlex、Europe PMC/PMC、Crossref、Semantic Scholar、NCBI OA；配置密钥后额外查询 CORE。
+- 并行查询 Unpaywall、OpenAlex、OpenAIRE、Europe PMC/PMC、Crossref、Semantic Scholar、NCBI OA；配置密钥后额外查询 CORE。
+- 可选调用用户本人授权的 Elsevier TDM、Wiley TDM；只接受完整 `%PDF`，Elsevier 的“仅第一页”响应会被拒绝。
 - 自动调用 `fetchpdf` 做更广的开放获取兜底。
 - 可选 Playwright 机构浏览器兜底，复用本机登录状态处理有合法订阅权限的长尾出版商。
 - 下载成功后立即回挂 Zotero，意外中断后可安全重跑。
@@ -50,7 +51,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 2. 启动 Zotero，在“设置 → 高级”中启用“允许其他应用程序与 Zotero 通信”。
 3. 第一次运行时 Zotero 会弹出本地授权框，请选择“始终允许 / Always Allow”。密钥只存放在本机用户配置目录，不会写入仓库。
 
-CORE、OpenAlex、Semantic Scholar、NCBI、Elsevier、Springer 的 API 密钥都是可选项，可在 `.env` 中配置以提高覆盖率或降低限速。不要提交 `.env`。
+CORE、OpenAlex、Semantic Scholar、NCBI、Elsevier、Wiley、Springer 的 API 密钥都是可选项，可在 `.env` 中配置以提高覆盖率或降低限速。Elsevier/Wiley 密钥必须来自你本人合法注册或机构授权，不会绕过付费墙。不要提交 `.env`。
 
 ## 使用
 
@@ -102,7 +103,8 @@ Zotero 分类
   ├─ 已有 PDF → 跳过
   └─ 无 PDF
       ├─ Unpaywall / OpenAlex / Europe PMC / PMC
-      ├─ Crossref / Semantic Scholar / NCBI OA / CORE（可选密钥）
+      ├─ OpenAIRE 仓储发现 / Crossref / Semantic Scholar / NCBI OA / CORE（可选密钥）
+      ├─ Elsevier TDM / Wiley TDM（可选、需本人授权密钥）
       ├─ fetchpdf 多来源兜底
       └─ 机构浏览器（可选，本人合法订阅）
            ↓
