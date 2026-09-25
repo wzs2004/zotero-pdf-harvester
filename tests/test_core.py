@@ -1,6 +1,6 @@
 import os
 
-from zotero_pdf_harvester.cli import apply_env, env_file, normalize_doi, safe_name
+from zotero_pdf_harvester.cli import Harvester, apply_env, env_file, normalize_doi, safe_name
 
 
 def test_normalize_doi():
@@ -22,3 +22,9 @@ def test_apply_env_resolves_browser_profile(tmp_path, monkeypatch):
     monkeypatch.delenv("BROWSER_FALLBACK_PROFILE", raising=False)
     apply_env({"BROWSER_FALLBACK_PROFILE": "browser-profile"}, tmp_path)
     assert os.environ["BROWSER_FALLBACK_PROFILE"] == str(tmp_path / "browser-profile")
+
+
+def test_identifier_pmid():
+    assert Harvester.identifier_pmid({"extra": "PMID: 26474635"}) == "26474635"
+    assert Harvester.identifier_pmid({"PMID": "19221574"}) == "19221574"
+    assert Harvester.identifier_pmid({"extra": "PMCID: PMC123"}) == ""

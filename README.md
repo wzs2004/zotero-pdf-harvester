@@ -7,7 +7,8 @@
 ## 主要功能
 
 - 直接读取一个或多个 Zotero 分类，不需要导出 CSV。
-- 并行查询 Unpaywall、OpenAlex、OpenAIRE、Europe PMC/PMC、Crossref、Semantic Scholar、NCBI OA；配置密钥后额外查询 CORE。
+- 并行查询 Unpaywall、OpenAlex、OpenAIRE、DOAJ、Zenodo、HAL、Europe PMC/PMC、Crossref、Semantic Scholar、NCBI OA；配置密钥后额外查询 CORE。
+- 对只有 PMID 的条目查询 PubMed 免费 LinkOut，并从期刊页的 `citation_pdf_url` 等标准元数据发现公开 PDF；DOI 条目也会尝试同一路径。
 - 可选调用用户本人授权的 Elsevier TDM、Wiley TDM；只接受完整 `%PDF`，Elsevier 的“仅第一页”响应会被拒绝。
 - 自动调用 `fetchpdf` 做更广的开放获取兜底。
 - 可选 Playwright 机构浏览器兜底，复用本机登录状态处理有合法订阅权限的长尾出版商。
@@ -90,7 +91,7 @@ CORE、OpenAlex、Semantic Scholar、NCBI、Elsevier、Wiley、Springer 的 API 
 ./run.sh --collection lys --institutional-browser
 ```
 
-第一次使用机构模式时会打开 Chromium。完成学校 SSO 登录后，Cookie 保存在本机浏览器 profile 中，后续运行会复用。该模式只对你所在机构确实订阅的内容有效，而且为避免同一 profile 并发损坏，会串行处理最后的长尾条目，因此只建议对快速模式未命中的条目使用。
+第一次使用机构模式时会打开 Chromium。完成学校 SSO 登录后，Cookie 保存在本机浏览器 profile 中，后续运行会复用。所有长尾条目在同一个浏览器会话中串行处理，不再为每篇文献重启浏览器；该模式只对你所在机构确实订阅的内容有效。
 
 自定义输出和报告：
 
@@ -116,7 +117,7 @@ Zotero 分类
   ├─ 已有 PDF → 跳过
   └─ 无 PDF
       ├─ Unpaywall / OpenAlex / Europe PMC / PMC
-      ├─ OpenAIRE 仓储发现 / Crossref / Semantic Scholar / NCBI OA / CORE（可选密钥）
+      ├─ OpenAIRE / DOAJ / Zenodo / HAL / Crossref / Semantic Scholar / NCBI OA / CORE（可选密钥）
       ├─ Elsevier TDM / Wiley TDM（可选、需本人授权密钥）
       ├─ fetchpdf 多来源兜底
       └─ 机构浏览器（可选，本人合法订阅）

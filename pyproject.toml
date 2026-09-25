@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zotero-pdf-harvester"
-version = "0.3.0"
+version = "0.3.1"
 description = "Fast, resumable legal-OA PDF harvesting and Zotero attachment"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,6 +16,7 @@ gui = ["flask>=3.0,<4"]
 
 full = [
   "flask>=3.0,<4",
+  "beautifulsoup4>=4.12,<5",
   "fetchpdf @ git+https://github.com/The-Metascience-Observatory/fetchpdf.git@82a4c474178a3e4245da82542c3a25434674e48e",
   "auto-paper-download[browser] @ git+https://github.com/jxtse/auto-paper-harvester.git@4184b55929d3091af12e65f78b1f2b19c594c6c2",
 ]

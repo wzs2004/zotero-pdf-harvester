@@ -14,8 +14,10 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from bs4 import BeautifulSoup
 from pyzotero import zotero
 from pyzotero._helpers import load_local_key, save_local_key
 
@@ -126,6 +128,171 @@ class Harvester:
                         return doi
         except Exception:
             pass
+        try:
+            query = urllib.parse.urlencode({"query": f'TITLE:"{title}"', "format": "json", "pageSize": 5})
+            hits = self.json("https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + query)
+            for hit in hits.get("resultList", {}).get("result", []):
+                actual = str(hit.get("title") or "")
+                a = set(re.findall(r"[a-z0-9]+", title.lower()))
+                b = set(re.findall(r"[a-z0-9]+", actual.lower()))
+                if len(a & b) / max(1, len(a)) >= 0.85:
+                    doi = normalize_doi(hit.get("doi"))
+                    if doi:
+                        return doi
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def identifier_pmid(data: dict) -> str:
+        """Return a PMID stored in Zotero's Extra field or a dedicated field."""
+        for value in (data.get("PMID"), data.get("pmid")):
+            if re.fullmatch(r"\d{6,9}", str(value or "").strip()):
+                return str(value).strip()
+        extra = str(data.get("extra") or "")
+        match = re.search(r"(?im)^\s*PMID\s*:\s*(\d{6,9})\s*$", extra)
+        return match.group(1) if match else ""
+
+    def title_identifiers(self, title: str) -> tuple[str, str]:
+        """Strict Europe PMC title match, returning DOI and PMID when present."""
+        if len(title) < 12:
+            return "", ""
+        try:
+            query = urllib.parse.urlencode({"query": f'TITLE:"{title}"', "format": "json", "pageSize": 8})
+            hits = self.json("https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + query)
+            wanted = set(re.findall(r"[a-z0-9]+", title.lower()))
+            for hit in hits.get("resultList", {}).get("result", []):
+                actual = set(re.findall(r"[a-z0-9]+", str(hit.get("title") or "").lower()))
+                if len(wanted & actual) / max(1, len(wanted)) >= 0.88:
+                    return normalize_doi(hit.get("doi")), str(hit.get("pmid") or "")
+        except Exception:
+            pass
+        return "", ""
+
+    def identifier_doi(self, data: dict) -> str:
+        doi = normalize_doi(data.get("DOI"))
+        if doi:
+            return doi
+        extra = str(data.get("extra") or "")
+        pmid = self.identifier_pmid(data)
+        if pmid:
+            try:
+                params = urllib.parse.urlencode({
+                    "db": "pubmed", "id": pmid, "retmode": "xml",
+                    "tool": "zotero-pdf-harvester", "email": self.email,
+                })
+                req = urllib.request.Request(
+                    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?" + params,
+                    headers={"User-Agent": self.ua},
+                )
+                with urllib.request.urlopen(req, timeout=12, context=SSL) as response:
+                    root = ET.fromstring(response.read())
+                for node in root.findall(".//ArticleId"):
+                    if node.attrib.get("IdType") == "doi":
+                        doi = normalize_doi(node.text)
+                        if doi:
+                            return doi
+            except Exception:
+                pass
+        return self.title_doi(str(data.get("title") or ""))
+
+    def page_pdf_candidates(self, url: str) -> tuple[list[tuple[str, str]], str]:
+        """Extract publisher-declared PDF URLs and DOI metadata from a free page."""
+        req = urllib.request.Request(url, headers={
+            "User-Agent": self.ua,
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.5",
+        })
+        with urllib.request.urlopen(req, timeout=self.timeout, context=SSL) as response:
+            final_url = response.geturl()
+            content_type = response.headers.get("Content-Type", "").lower()
+            body = response.read(4 * 1024 * 1024)
+        if body.startswith(b"%PDF"):
+            return [(final_url, "pubmed_linkout")], ""
+        if "html" not in content_type and b"<html" not in body[:4096].lower():
+            return [], ""
+        soup = BeautifulSoup(body, "html.parser")
+        found, doi = [], ""
+        pdf_meta_names = {
+            "citation_pdf_url", "dc.identifier.pdf", "eprints.document_url",
+            "wkhealth_pdf_url", "pdf_url",
+        }
+        for meta in soup.find_all("meta"):
+            name = str(meta.get("name") or meta.get("property") or "").strip().lower()
+            value = str(meta.get("content") or "").strip()
+            if not value:
+                continue
+            if name in pdf_meta_names or ("pdf" in name and value.startswith(("http://", "https://", "/"))):
+                found.append((urllib.parse.urljoin(final_url, value), "publisher_meta"))
+            if name in {"citation_doi", "dc.identifier", "dc.identifier.doi", "prism.doi"}:
+                doi = doi or normalize_doi(value)
+        for link in soup.find_all("link"):
+            href = str(link.get("href") or "").strip()
+            kind = str(link.get("type") or "").lower()
+            if href and (kind == "application/pdf" or "pdf" in str(link.get("title") or "").lower()):
+                found.append((urllib.parse.urljoin(final_url, href), "publisher_link"))
+        for anchor in soup.find_all("a", href=True):
+            href = str(anchor.get("href") or "").strip()
+            label = " ".join(anchor.stripped_strings).lower()
+            if href and (href.lower().split("?", 1)[0].endswith(".pdf") or label in {"pdf", "全文pdf", "pdf全文"}):
+                found.append((urllib.parse.urljoin(final_url, href), "publisher_link"))
+        seen = set()
+        return [(u, s) for u, s in found if not (u in seen or seen.add(u))], doi
+
+    def pmid_resolvers(self, pmid: str) -> tuple[list[tuple[str, str]], str]:
+        """Resolve legal free-full-text links advertised by PubMed and Europe PMC."""
+        found, discovered_doi = [], ""
+        try:
+            query = urllib.parse.urlencode({"query": f"EXT_ID:{pmid} AND SRC:MED", "format": "json", "pageSize": 3})
+            data = self.json("https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + query)
+            for row in data.get("resultList", {}).get("result", []):
+                discovered_doi = discovered_doi or normalize_doi(row.get("doi"))
+                if row.get("pmcid"):
+                    pmcid = row["pmcid"]
+                    found.extend([
+                        (f"https://europepmc.org/articles/{pmcid}/bin/{pmcid}.pdf", "europepmc"),
+                        (f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/", "pmc"),
+                    ])
+        except Exception:
+            pass
+        try:
+            params = urllib.parse.urlencode({
+                "dbfrom": "pubmed", "id": pmid, "cmd": "llinks", "retmode": "xml",
+                "tool": "zotero-pdf-harvester", "email": self.email,
+            })
+            req = urllib.request.Request(
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi?" + params,
+                headers={"User-Agent": self.ua},
+            )
+            with urllib.request.urlopen(req, timeout=15, context=SSL) as response:
+                root = ET.fromstring(response.read())
+            pages = []
+            for obj in root.findall(".//ObjUrl"):
+                attrs = {str(node.text or "").strip().lower() for node in obj.findall("Attribute")}
+                url = obj.findtext("Url", "").strip()
+                if url and ("free resource" in attrs or "free" in attrs):
+                    pages.append(url)
+            for page in pages:
+                try:
+                    candidates, page_doi = self.page_pdf_candidates(page)
+                    found.extend(candidates)
+                    discovered_doi = discovered_doi or page_doi
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        seen = set()
+        return [(u, s) for u, s in found if not (u in seen or seen.add(u))], discovered_doi
+
+    def doi_pmid(self, doi: str) -> str:
+        """Map a DOI to PMID so PubMed's curated free LinkOut can be tried."""
+        try:
+            query = urllib.parse.urlencode({"query": f'DOI:"{doi}"', "format": "json", "pageSize": 3})
+            data = self.json("https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + query)
+            for row in data.get("resultList", {}).get("result", []):
+                if normalize_doi(row.get("doi")) == doi and row.get("pmid"):
+                    return str(row["pmid"])
+        except Exception:
+            pass
         return ""
 
     def resolvers(self, doi: str):
@@ -178,6 +345,50 @@ class Harvester:
                     continue
             return out
 
+        def doaj():
+            # DOAJ has direct full-text links for journals that are fully OA,
+            # including records occasionally missed by Unpaywall.
+            query = urllib.parse.quote(f'bibjson.identifier.id:"{doi}"', safe="")
+            d = self.json(f"https://doaj.org/api/search/articles/{query}?pageSize=5")
+            out = []
+            for row in d.get("results", []):
+                for link in row.get("bibjson", {}).get("link", []) or []:
+                    url = link.get("url") if isinstance(link, dict) else ""
+                    kind = str(link.get("type", "")).lower() if isinstance(link, dict) else ""
+                    if url and ("fulltext" in kind or "pdf" in kind or url.lower().endswith(".pdf")):
+                        out.append((url, "doaj"))
+            return out
+
+        def zenodo():
+            q = urllib.parse.urlencode({"q": f'doi:"{doi}"', "size": 10})
+            d = self.json("https://zenodo.org/api/records?" + q)
+            out = []
+            for record in d.get("hits", {}).get("hits", []):
+                for file in record.get("files", []) or []:
+                    links = file.get("links", {}) if isinstance(file, dict) else {}
+                    url = links.get("content") or links.get("self")
+                    name = str(file.get("key") or "").lower() if isinstance(file, dict) else ""
+                    mime = str(file.get("mimetype") or "").lower() if isinstance(file, dict) else ""
+                    if url and (name.endswith(".pdf") or mime == "application/pdf"):
+                        out.append((url, "zenodo"))
+            return out
+
+        def hal():
+            q = urllib.parse.urlencode({
+                "q": f'doiId_s:"{doi}"',
+                "fl": "fileMain_s,files_s,uri_s",
+                "rows": 10,
+                "wt": "json",
+            })
+            d = self.json("https://api.archives-ouvertes.fr/search/?" + q)
+            out = []
+            for row in d.get("response", {}).get("docs", []):
+                values = [row.get("fileMain_s")] + list(row.get("files_s") or [])
+                for url in values:
+                    if isinstance(url, str) and url.startswith(("http://", "https://")):
+                        out.append((url, "hal"))
+            return out
+
         def springer():
             if not self.springer_key or not doi.startswith(("10.1007/", "10.1186/")):
                 return []
@@ -217,8 +428,11 @@ class Harvester:
             ids = d.get("esearchresult", {}).get("idlist", [])
             return [(f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{x}/pdf", "ncbi_oa") for x in ids]
 
-        with cf.ThreadPoolExecutor(max_workers=7) as pool:
-            futures = [pool.submit(fn) for fn in (unpaywall, openalex, europepmc, crossref, openaire, springer, semantic, core, ncbi_oa)]
+        with cf.ThreadPoolExecutor(max_workers=12) as pool:
+            futures = [pool.submit(fn) for fn in (
+                unpaywall, openalex, europepmc, crossref, openaire, doaj,
+                zenodo, hal, springer, semantic, core, ncbi_oa,
+            )]
             for future in futures:
                 try:
                     found.extend(future.result(timeout=12))
@@ -355,34 +569,117 @@ class Harvester:
         except Exception as error:
             print(f"学校登录窗口未完成：{type(error).__name__}", flush=True)
 
+    def institutional_batch(self, pending: list[dict]) -> list[dict]:
+        """Retry missing DOI records in one persistent, authenticated browser."""
+        if not pending:
+            return pending
+        try:
+            from playwright.sync_api import sync_playwright
+            from auto_paper_download.browser_fallback import GENERIC_PDF_SELECTORS, PUBLISHER_PDF_SELECTORS
+            from auto_paper_download.publishers import classify_publisher
+        except ImportError as error:
+            print(f"机构浏览器不可用：{error}", flush=True)
+            return pending
+        profile = Path(os.environ.get("BROWSER_FALLBACK_PROFILE", "browser-profile")).expanduser()
+        profile.mkdir(parents=True, exist_ok=True)
+        channel = os.environ.get("BROWSER_FALLBACK_CHANNEL") or ("chrome" if sys.platform == "darwin" else None)
+        login_wait = int(os.environ.get("BROWSER_LOGIN_WAIT_SECONDS", "300"))
+        auth_words = ("login", "signin", "sso", "shibboleth", "openathens", "oauth", "saml", "ezproxy")
+        print(f"机构浏览器批处理：共 {len(pending)} 条，复用同一登录会话。", flush=True)
+        try:
+            with sync_playwright() as pw:
+                context = pw.chromium.launch_persistent_context(
+                    str(profile), channel=channel, headless=False, accept_downloads=True,
+                )
+                page = context.pages[0] if context.pages else context.new_page()
+                page.set_default_timeout(max(15000, self.timeout * 1000))
+                for index, result in enumerate(pending, 1):
+                    doi = result.get("doi") or ""
+                    target = self.output / safe_name(doi)
+                    try:
+                        page.goto(f"https://doi.org/{doi}", wait_until="domcontentloaded", timeout=60000)
+                        if any(word in page.url.lower() for word in auth_words):
+                            print(f"需要学校登录；窗口将等待最多 {login_wait} 秒。", flush=True)
+                            deadline = time.time() + login_wait
+                            while time.time() < deadline and any(word in page.url.lower() for word in auth_words):
+                                page.wait_for_timeout(2000)
+                        info = classify_publisher(doi)
+                        family = info.family if info else "unknown"
+                        selectors = list(PUBLISHER_PDF_SELECTORS.get(family, ())) + list(GENERIC_PDF_SELECTORS)
+                        locator = None
+                        for selector in selectors:
+                            candidate = page.locator(selector).first
+                            if candidate.count() and candidate.is_visible():
+                                locator = candidate
+                                break
+                        if locator is not None:
+                            href = locator.get_attribute("href")
+                            if href:
+                                url = urllib.parse.urljoin(page.url, href)
+                                response = context.request.get(
+                                    url, headers={"Accept": "application/pdf,*/*;q=0.8", "Referer": page.url},
+                                    timeout=max(30000, self.timeout * 1000),
+                                )
+                                body = response.body()
+                                if response.ok and body.startswith(b"%PDF") and len(body) >= 8000:
+                                    target.write_bytes(body)
+                        if target.exists() and target.read_bytes()[:5] == b"%PDF":
+                            result.update(status="ready", source="institutional_browser", file=str(target))
+                            self.attach(result)
+                            result["status"] = "downloaded"
+                            print(f"attached {doi} [institutional_browser]", flush=True)
+                        else:
+                            result["browser_status"] = "not_entitled_or_no_pdf_link"
+                    except Exception as error:
+                        result["browser_status"] = type(error).__name__
+                    if index % 10 == 0:
+                        print(f"institutional progress {index}/{len(pending)}", flush=True)
+                context.close()
+        except Exception as error:
+            print(f"机构浏览器批处理失败：{type(error).__name__}: {error}", flush=True)
+        return pending
+
     def resolve(self, item, fallback_timeout: int):
         key, data = item["key"], item.get("data", {})
         if self.has_pdf(key):
             return {"key": key, "status": "existing", "title": data.get("title", "")}
-        doi = normalize_doi(data.get("DOI")) or self.title_doi(str(data.get("title") or ""))
-        if not doi:
+        pmid = self.identifier_pmid(data)
+        doi = self.identifier_doi(data)
+        if not doi and not pmid:
+            title_doi, title_pmid = self.title_identifiers(str(data.get("title") or ""))
+            doi, pmid = title_doi, title_pmid
+        if not doi and not pmid:
             return {"key": key, "status": "no_identifier", "title": data.get("title", "")}
-        target = self.output / safe_name(doi)
+        identifier = doi or f"pmid-{pmid}"
+        target = self.output / safe_name(identifier)
         source = "cache" if target.exists() else ""
-        if not source:
+        if not source and doi:
             source = self.special_download(doi, target)
-        if not source:
+        if not source and doi:
             for url, candidate_source in self.resolvers(doi):
                 if self.download(url, target):
                     source = candidate_source; break
-        if not source and self.fallback(doi, target, fallback_timeout):
+        if not source and doi:
+            pmid = pmid or self.doi_pmid(doi)
+            try:
+                candidates, _ = self.page_pdf_candidates("https://doi.org/" + doi)
+                for url, candidate_source in candidates:
+                    if self.download(url, target):
+                        source = candidate_source; break
+            except Exception:
+                pass
+        if not source and pmid:
+            candidates, discovered_doi = self.pmid_resolvers(pmid)
+            doi = doi or discovered_doi
+            for url, candidate_source in candidates:
+                if self.download(url, target):
+                    source = candidate_source; break
+        if not source and doi and self.fallback(doi, target, fallback_timeout):
             source = "fetchpdf"
-        browser_status = ""
-        if not source and self.browser_fallback:
-            ok, browser_status = self.institutional_fallback(doi, target)
-            if ok:
-                source = "institutional_browser"
         if not source:
-            result = {"key": key, "doi": doi, "status": "not_found", "title": data.get("title", "")}
-            if browser_status:
-                result["browser_status"] = browser_status
+            result = {"key": key, "doi": doi, "pmid": pmid, "status": "not_found", "title": data.get("title", "")}
             return result
-        return {"key": key, "doi": doi, "status": "ready", "source": source,
+        return {"key": key, "doi": doi, "pmid": pmid, "status": "ready", "source": source,
                 "file": str(target), "title": data.get("title", "")}
 
     def attach(self, result):
@@ -457,6 +754,9 @@ def main():
             results.append(result)
             if len(results) % 10 == 0:
                 print(f"progress {len(results)}/{len(items)}", flush=True)
+    if args.institutional_browser:
+        pending = [result for result in results if result.get("status") == "not_found" and result.get("doi")]
+        harvester.institutional_batch(pending)
     counts = {status: sum(x["status"] == status for x in results) for status in sorted({x["status"] for x in results})}
     report = {"generated": time.strftime("%Y-%m-%d %H:%M:%S"), "collections": keys, "counts": counts, "items": results}
     report_path = Path(args.report); report_path.parent.mkdir(parents=True, exist_ok=True)
