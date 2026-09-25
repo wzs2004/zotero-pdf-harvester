@@ -1,77 +1,141 @@
 # Zotero PDF Harvester
 
-Fast, resumable bulk retrieval of **legal open-access PDFs**, followed by automatic
-attachment to their parent items through Zotero's Local API.
+面向 Zotero 的批量 PDF 补全工具：从合法开放获取来源搜索全文，下载成功后自动作为附件回挂到原文献条目。项目可缓存、可重复运行，已经有 PDF 的条目会跳过。
 
-## Why this exists
+> 本项目不使用 Sci-Hub，也不绕过付费墙。机构浏览器模式只复用你本人已获授权的学校/机构订阅。
 
-General PDF downloaders often become slow because one publisher request can hang an
-entire worker pool. This project uses:
+## 主要功能
 
-- parallel metadata resolution through Unpaywall, OpenAlex, Europe PMC, Crossref,
-  and Semantic Scholar;
-- short timeout per candidate URL;
-- immediate Zotero attachment after each successful download;
-- disk caching and safe reruns;
-- an optional `fetchpdf` fallback launched once per DOI under a real OS-level timeout.
+- 直接读取一个或多个 Zotero 分类，不需要导出 CSV。
+- 并行查询 Unpaywall、OpenAlex、Europe PMC/PMC、Crossref、Semantic Scholar、NCBI OA；配置密钥后额外查询 CORE。
+- 自动调用 `fetchpdf` 做更广的开放获取兜底。
+- 可选 Playwright 机构浏览器兜底，复用本机登录状态处理有合法订阅权限的长尾出版商。
+- 下载成功后立即回挂 Zotero，意外中断后可安全重跑。
+- 短网络超时、单 DOI 硬超时和磁盘缓存，避免一个慢站点拖死整批任务。
+- 输出 JSON 报告，保留未命中和失败原因。
 
-It never uses Sci-Hub or attempts to bypass a paywall. A missing result can mean that
-no legal public PDF exists. If you have institutional access, add an authenticated
-publisher/TDM or browser layer separately.
+## 新电脑一键安装
 
-## Requirements
+### macOS / Linux
 
-- Python 3.10+
-- Zotero desktop running with **Settings → Advanced → Allow other applications on
-  this computer to communicate with Zotero** enabled
-- A Zotero Local API key authorized once by `pyzotero`
-
-## Install
+先安装 [Python 3.10+](https://www.python.org/downloads/) 和 Git，然后：
 
 ```bash
-python -m venv .venv
-.venv/bin/pip install -e .
+git clone https://github.com/wzs2004/zotero-pdf-harvester.git
+cd zotero-pdf-harvester
+./install.sh
 ```
 
-Optional deep fallback:
+安装脚本会自动创建 `.venv`，安装本项目、`fetchpdf`、机构浏览器组件及 Chromium，并复制 `.env.example` 为 `.env`。
 
-```bash
-.venv/bin/pip install 'fetchpdf @ git+https://github.com/The-Metascience-Observatory/fetchpdf.git'
+### Windows PowerShell
+
+```powershell
+git clone https://github.com/wzs2004/zotero-pdf-harvester.git
+cd zotero-pdf-harvester
+Set-ExecutionPolicy -Scope Process Bypass
+.\install.ps1
 ```
 
-## Run
+## 首次配置
 
-Collection names and keys are both accepted. Repeat `--collection` for several
-libraries:
+1. 编辑 `.env`，至少填写：
+
+   ```dotenv
+   ZPH_EMAIL=you@example.com
+   ```
+
+   邮箱仅用于 Unpaywall、Crossref 等公开学术 API 的礼貌访问标识。
+
+2. 启动 Zotero，在“设置 → 高级”中启用“允许其他应用程序与 Zotero 通信”。
+3. 第一次运行时 Zotero 会弹出本地授权框，请选择“始终允许 / Always Allow”。密钥只存放在本机用户配置目录，不会写入仓库。
+
+CORE、OpenAlex、Semantic Scholar、NCBI、Elsevier、Springer 的 API 密钥都是可选项，可在 `.env` 中配置以提高覆盖率或降低限速。不要提交 `.env`。
+
+## 使用
+
+快速公开来源 + `fetchpdf` 兜底：
 
 ```bash
-.venv/bin/zotero-pdf-harvester \
+./run.sh --collection '楔状缺损_NCCL_有限元'
+./run.sh --collection lys
+```
+
+一次处理多个分类：
+
+```bash
+./run.sh \
   --collection '楔状缺损_NCCL_有限元' \
   --collection lys \
-  --email you@example.com \
-  --workers 20 \
-  --fallback-cli .venv/bin/fetchpdf \
-  --output downloads \
-  --report reports/latest.json
+  --workers 20
 ```
 
-Re-run the same command at any time. Existing Zotero PDF attachments and cached
-downloads are skipped.
+使用学校/机构订阅兜底：
 
-## Performance notes
+```bash
+./run.sh --collection lys --institutional-browser
+```
 
-The fast API pass usually handles hundreds of Zotero items in about a minute. The
-deep fallback is intentionally bounded per DOI. Increase `--fallback-timeout` only
-when you accept slower completion for a small chance of retrieving more papers.
+第一次使用机构模式时会打开 Chromium。完成学校 SSO 登录后，Cookie 保存在本机浏览器 profile 中，后续运行会复用。该模式只对你所在机构确实订阅的内容有效，而且为避免同一 profile 并发损坏，会串行处理最后的长尾条目，因此只建议对快速模式未命中的条目使用。
 
-## Related projects
+自定义输出和报告：
 
-- [fetchpdf](https://github.com/The-Metascience-Observatory/fetchpdf): broad
-  multi-source fallback coverage.
-- [auto-paper-harvester](https://github.com/jxtse/auto-paper-harvester): publisher
-  routing, TDM APIs, and optional institutional browser sessions.
-- [OpenAlex bulk downloader](https://github.com/ourresearch/openalex-official):
-  official OpenAlex PDF/TEI bulk tooling.
+```bash
+./run.sh \
+  --collection lys \
+  --output downloads \
+  --report reports/lys.json \
+  --timeout 18 \
+  --fallback-timeout 40
+```
+
+完整参数：
+
+```bash
+./run.sh --help
+```
+
+## 获取链路
+
+```text
+Zotero 分类
+  ├─ 已有 PDF → 跳过
+  └─ 无 PDF
+      ├─ Unpaywall / OpenAlex / Europe PMC / PMC
+      ├─ Crossref / Semantic Scholar / NCBI OA / CORE（可选密钥）
+      ├─ fetchpdf 多来源兜底
+      └─ 机构浏览器（可选，本人合法订阅）
+           ↓
+        验证 PDF → 自动回挂 Zotero → JSON 报告
+```
+
+未找到 PDF 不一定是程序故障，常见原因包括：没有公开全文、只有订阅版本、机构没有订阅、出版社反自动化验证、元数据缺少 DOI，或远端服务暂时限速。
+
+## 为什么比逐条浏览器搜索快
+
+- 元数据来源并行查询；候选 PDF 一旦成功立即停止。
+- 快速公开来源先跑，较慢的 `fetchpdf` 和机构浏览器只处理长尾。
+- 单个候选 URL、单个 DOI 都有明确超时。
+- 已有附件与本地缓存不会重复下载。
+- 机构浏览器串行运行，避免多个进程争用同一个登录 profile。
+
+## 测试
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+## 借鉴与依赖
+
+- [The-Metascience-Observatory/fetchpdf](https://github.com/The-Metascience-Observatory/fetchpdf)：多来源 OA、仓储和出版社兜底。
+- [jxtse/auto-paper-harvester](https://github.com/jxtse/auto-paper-harvester)：出版商路由、TDM API 和机构浏览器会话。
+- [OpenAlex](https://github.com/ourresearch/openalex-official)：开放学术元数据和 OA 地址。
+
+## 隐私与合规
+
+- 不提交 Zotero 本地密钥、API 密钥、邮箱、机构 Cookie 或浏览器 profile。
+- 只下载开放获取内容，或你本人已有合法访问权限的内容。
+- 请遵守出版商、机构和 API 的服务条款及频率限制。
 
 ## License
 

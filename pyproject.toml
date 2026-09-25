@@ -4,18 +4,27 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zotero-pdf-harvester"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fast, resumable legal-OA PDF harvesting and Zotero attachment"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = ["pyzotero>=1.6.0"]
 
+[project.optional-dependencies]
+full = [
+  "fetchpdf @ git+https://github.com/The-Metascience-Observatory/fetchpdf.git@82a4c474178a3e4245da82542c3a25434674e48e",
+  "auto-paper-download[browser] @ git+https://github.com/jxtse/auto-paper-harvester.git@4184b55929d3091af12e65f78b1f2b19c594c6c2",
+]
+
 [project.scripts]
 zotero-pdf-harvester = "zotero_pdf_harvester.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zotero_pdf_harvester"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
