@@ -14,6 +14,7 @@
 - 下载成功后立即回挂 Zotero，意外中断后可安全重跑。
 - 短网络超时、单 DOI 硬超时和磁盘缓存，避免一个慢站点拖死整批任务。
 - 输出 JSON 报告，保留未命中和失败原因。
+- 中文本地网页界面：选择 Zotero 分类、并发数和校园网模式后直接运行。
 
 ## 新电脑一键安装
 
@@ -54,6 +55,18 @@ Set-ExecutionPolicy -Scope Process Bypass
 CORE、OpenAlex、Semantic Scholar、NCBI、Elsevier、Wiley、Springer 的 API 密钥都是可选项，可在 `.env` 中配置以提高覆盖率或降低限速。Elsevier/Wiley 密钥必须来自你本人合法注册或机构授权，不会绕过付费墙。不要提交 `.env`。
 
 ## 使用
+
+### 图形界面（推荐）
+
+```bash
+./start-gui.sh
+```
+
+浏览器会自动打开 `http://127.0.0.1:8765`。勾选“校园网/机构浏览器”后，首次遇到学校登录会打开独立 Chromium；完成登录后，Cookie 保存在仓库的 `browser-profile/`（已被 Git 忽略），以后自动复用。校园网 IP 自动授权也会直接生效。
+
+> 不能直接读取正在运行的 Chrome/Safari 密码和 Cookie；这既不安全，也会导致浏览器 profile 锁冲突。项目使用自己的持久化浏览器，只需登录一次。
+
+### 终端
 
 快速公开来源 + `fetchpdf` 兜底：
 

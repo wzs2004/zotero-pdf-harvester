@@ -13,9 +13,12 @@ python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/pip install -e '.[full]'
 .venv/bin/pip install pytest
-.venv/bin/playwright install chromium
+# macOS 优先使用已安装的 Google Chrome，避免额外下载约 180 MB Chromium。
+if [ "$(uname -s)" != "Darwin" ] || [ ! -d "/Applications/Google Chrome.app" ]; then
+  .venv/bin/playwright install chromium
+fi
 [ -f .env ] || cp .env.example .env
 
 echo
 echo "安装完成。请编辑 .env 填写 ZPH_EMAIL，然后运行："
-echo "  ./run.sh --collection '你的 Zotero 分类名'"
+echo "  ./start-gui.sh"

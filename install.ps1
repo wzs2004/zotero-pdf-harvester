@@ -7,5 +7,5 @@ python -m venv .venv
 & .\.venv\Scripts\pip.exe install pytest
 & .\.venv\Scripts\playwright.exe install chromium
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-Write-Host "安装完成。请编辑 .env，然后运行："
-Write-Host ".\.venv\Scripts\zotero-pdf-harvester.exe --collection '你的 Zotero 分类名'"
+Write-Host "安装完成。请编辑 .env，然后运行图形界面："
+Write-Host ".\.venv\Scripts\zotero-pdf-harvester-gui.exe"

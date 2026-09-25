@@ -9,6 +9,7 @@ import re
 import shutil
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -311,9 +312,48 @@ class Harvester:
                 if saved and saved.exists() and saved.read_bytes()[:5].startswith(b"%PDF"):
                     shutil.copy2(saved, target)
                     return True, "institutional_browser"
+                if result.status == "auth_redirect":
+                    self.institutional_login(doi)
+                    result = browser_fallback_download(
+                        doi=doi, output_dir=self.output / "_institutional",
+                        publisher_family=family or "unknown", timeout_ms=max(15000, self.timeout * 1000),
+                    )
+                    saved = Path(result.saved_path) if result.success and result.saved_path else None
+                    if saved and saved.exists() and saved.read_bytes()[:5].startswith(b"%PDF"):
+                        shutil.copy2(saved, target)
+                        return True, "institutional_browser"
                 return False, result.status or "browser_failed"
             except Exception:
                 return False, "browser_error"
+
+    def institutional_login(self, doi: str):
+        """Keep a persistent browser open while the user completes school SSO."""
+        try:
+            from playwright.sync_api import sync_playwright
+            profile = Path(os.environ.get(
+                "BROWSER_FALLBACK_PROFILE",
+                Path.home() / ".cache" / "auto_paper_download" / "browser_profile",
+            )).expanduser()
+            profile.mkdir(parents=True, exist_ok=True)
+            channel = os.environ.get("BROWSER_FALLBACK_CHANNEL") or ("chrome" if sys.platform == "darwin" else None)
+            wait_seconds = int(os.environ.get("BROWSER_LOGIN_WAIT_SECONDS", "300"))
+            print(f"需要学校登录：浏览器将保持最多 {wait_seconds} 秒；完成登录后会自动继续。", flush=True)
+            with sync_playwright() as pw:
+                context = pw.chromium.launch_persistent_context(
+                    str(profile), channel=channel, headless=False, accept_downloads=True,
+                )
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(f"https://doi.org/{doi}", wait_until="domcontentloaded", timeout=60000)
+                deadline = time.time() + wait_seconds
+                while time.time() < deadline:
+                    current = page.url.lower()
+                    if not any(x in current for x in ("login", "signin", "sso", "shibboleth", "openathens", "oauth", "saml")):
+                        page.wait_for_timeout(5000)
+                        break
+                    page.wait_for_timeout(2000)
+                context.close()
+        except Exception as error:
+            print(f"学校登录窗口未完成：{type(error).__name__}", flush=True)
 
     def resolve(self, item, fallback_timeout: int):
         key, data = item["key"], item.get("data", {})
@@ -363,13 +403,20 @@ def env_file(path: Path = Path(".env")):
             k, v = line.split("=", 1); out[k.strip()] = v.strip().strip('\"')
     return out
 
+
+def apply_env(env: dict, base: Path = Path.cwd()):
+    """Expose .env and resolve project-relative browser profile paths."""
+    for key, value in env.items():
+        if key == "BROWSER_FALLBACK_PROFILE" and value and not Path(value).expanduser().is_absolute():
+            value = str((base / value).resolve())
+        os.environ.setdefault(key, value)
+
 def main():
     env = env_file()
     # Child tools (fetchpdf, publisher clients, Playwright fallback) read their
     # credentials from the process environment. Keep explicit shell variables
     # authoritative while making values from this project's .env available.
-    for key, value in env.items():
-        os.environ.setdefault(key, value)
+    apply_env(env)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--collection", action="append", required=True, help="collection name or key; repeatable")
     parser.add_argument("--email", default=env.get("ZPH_EMAIL", os.environ.get("ZPH_EMAIL", "")), help="email for polite public API access")
