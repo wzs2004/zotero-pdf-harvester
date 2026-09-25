@@ -1,4 +1,5 @@
 import os
+import xml.etree.ElementTree as ET
 
 from zotero_pdf_harvester.cli import Harvester, apply_env, env_file, normalize_doi, safe_name
 
@@ -28,3 +29,11 @@ def test_identifier_pmid():
     assert Harvester.identifier_pmid({"extra": "PMID: 26474635"}) == "26474635"
     assert Harvester.identifier_pmid({"PMID": "19221574"}) == "19221574"
     assert Harvester.identifier_pmid({"extra": "PMCID: PMC123"}) == ""
+
+
+def test_html_pdf_candidates_extracts_standard_metadata():
+    harvester = object.__new__(Harvester)
+    body = b'<html><meta name="citation_pdf_url" content="/article/file.pdf"></html>'
+    candidates, doi = harvester.html_pdf_candidates(body, "https://journal.example/paper")
+    assert candidates == [("https://journal.example/article/file.pdf", "publisher_meta")]
+    assert doi == ""

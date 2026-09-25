@@ -45,6 +45,9 @@ class Harvester:
         self.wiley_token = os.environ.get("WILEY_TDM_TOKEN", "")
         self.springer_key = os.environ.get("SPRINGER_API_KEY", "")
         self.browser_lock = threading.Lock()
+        self.ncbi_lock = threading.Lock()
+        self.ncbi_last_request = 0.0
+        self.ncbi_key = os.environ.get("NCBI_API_KEY", "")
         self.ua = f"zotero-pdf-harvester/0.2 (mailto:{email})"
         output.mkdir(parents=True, exist_ok=True)
         server_id, local_key = load_local_key()
@@ -76,6 +79,33 @@ class Harvester:
         req = urllib.request.Request(LOCAL_API + path, headers={"User-Agent": self.ua})
         with urllib.request.urlopen(req, timeout=15) as response:
             return json.load(response)
+
+    def ncbi_xml(self, endpoint: str, params: dict) -> ET.Element:
+        """Call NCBI E-utilities within its rate limit and retry transients."""
+        params = dict(params)
+        params.update({"tool": "zotero-pdf-harvester", "email": self.email})
+        if self.ncbi_key:
+            params["api_key"] = self.ncbi_key
+        url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/" + endpoint + "?" + urllib.parse.urlencode(params)
+        interval = 0.11 if self.ncbi_key else 0.34
+        last_error = None
+        for attempt in range(3):
+            try:
+                with self.ncbi_lock:
+                    delay = interval - (time.monotonic() - self.ncbi_last_request)
+                    if delay > 0:
+                        time.sleep(delay)
+                    req = urllib.request.Request(url, headers={"User-Agent": self.ua})
+                    try:
+                        with urllib.request.urlopen(req, timeout=15, context=SSL) as response:
+                            body = response.read()
+                    finally:
+                        self.ncbi_last_request = time.monotonic()
+                return ET.fromstring(body)
+            except Exception as error:
+                last_error = error
+                time.sleep(0.5 * (attempt + 1))
+        raise last_error or RuntimeError("NCBI request failed")
 
     def collections(self):
         return self.local("/collections?limit=100")
@@ -177,16 +207,9 @@ class Harvester:
         pmid = self.identifier_pmid(data)
         if pmid:
             try:
-                params = urllib.parse.urlencode({
+                root = self.ncbi_xml("efetch.fcgi", {
                     "db": "pubmed", "id": pmid, "retmode": "xml",
-                    "tool": "zotero-pdf-harvester", "email": self.email,
                 })
-                req = urllib.request.Request(
-                    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?" + params,
-                    headers={"User-Agent": self.ua},
-                )
-                with urllib.request.urlopen(req, timeout=12, context=SSL) as response:
-                    root = ET.fromstring(response.read())
                 for node in root.findall(".//ArticleId"):
                     if node.attrib.get("IdType") == "doi":
                         doi = normalize_doi(node.text)
@@ -210,6 +233,10 @@ class Harvester:
             return [(final_url, "pubmed_linkout")], ""
         if "html" not in content_type and b"<html" not in body[:4096].lower():
             return [], ""
+        return self.html_pdf_candidates(body, final_url)
+
+    def html_pdf_candidates(self, body: bytes, final_url: str) -> tuple[list[tuple[str, str]], str]:
+        """Parse standard scholarly HTML metadata without site-specific scraping."""
         soup = BeautifulSoup(body, "html.parser")
         found, doi = [], ""
         pdf_meta_names = {
@@ -238,6 +265,70 @@ class Harvester:
         seen = set()
         return [(u, s) for u, s in found if not (u in seen or seen.add(u))], doi
 
+    def title_resolvers(self, title: str) -> list[tuple[str, str]]:
+        """Find repository copies whose titles strictly match the Zotero record."""
+        if len(title) < 12:
+            return []
+        wanted = set(re.findall(r"[a-z0-9]+", title.lower()))
+        found = []
+
+        def matches(actual: str, threshold: float = 0.9) -> bool:
+            words = set(re.findall(r"[a-z0-9]+", str(actual or "").lower()))
+            return len(wanted & words) / max(1, len(wanted)) >= threshold
+
+        def openalex_title():
+            params = urllib.parse.urlencode({"search": title, "per-page": 5, "mailto": self.email})
+            data = self.json("https://api.openalex.org/works?" + params)
+            out = []
+            for row in data.get("results", []):
+                if not matches(row.get("title", "")):
+                    continue
+                locations = ([row.get("best_oa_location")] if row.get("best_oa_location") else []) + (row.get("locations") or [])
+                for location in locations:
+                    if not location:
+                        continue
+                    for url in (location.get("pdf_url"), location.get("landing_page_url")):
+                        if url:
+                            out.append((url, "openalex_title"))
+            return out
+
+        def semantic_title():
+            params = urllib.parse.urlencode({"query": title, "limit": 5, "fields": "title,openAccessPdf"})
+            data = self.json("https://api.semanticscholar.org/graph/v1/paper/search?" + params)
+            out = []
+            for row in data.get("data", []):
+                pdf = row.get("openAccessPdf") or {}
+                if matches(row.get("title", "")) and pdf.get("url"):
+                    out.append((pdf["url"], "semantic_title"))
+            return out
+
+        def hal_title():
+            params = urllib.parse.urlencode({
+                "q": f'title_t:\"{title}\"', "fl": "title_s,fileMain_s,files_s", "rows": 5, "wt": "json",
+            })
+            data = self.json("https://api.archives-ouvertes.fr/search/?" + params)
+            out = []
+            for row in data.get("response", {}).get("docs", []):
+                actual = row.get("title_s") or ""
+                if isinstance(actual, list):
+                    actual = " ".join(actual)
+                if not matches(actual):
+                    continue
+                for url in [row.get("fileMain_s")] + list(row.get("files_s") or []):
+                    if isinstance(url, str):
+                        out.append((url, "hal_title"))
+            return out
+
+        with cf.ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(fn) for fn in (openalex_title, semantic_title, hal_title)]
+            for future in futures:
+                try:
+                    found.extend(future.result(timeout=12))
+                except Exception:
+                    pass
+        seen = set()
+        return [(u, s) for u, s in found if u.startswith(("http://", "https://")) and not (u in seen or seen.add(u))]
+
     def pmid_resolvers(self, pmid: str) -> tuple[list[tuple[str, str]], str]:
         """Resolve legal free-full-text links advertised by PubMed and Europe PMC."""
         found, discovered_doi = [], ""
@@ -255,21 +346,18 @@ class Harvester:
         except Exception:
             pass
         try:
-            params = urllib.parse.urlencode({
+            root = self.ncbi_xml("elink.fcgi", {
                 "dbfrom": "pubmed", "id": pmid, "cmd": "llinks", "retmode": "xml",
-                "tool": "zotero-pdf-harvester", "email": self.email,
             })
-            req = urllib.request.Request(
-                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi?" + params,
-                headers={"User-Agent": self.ua},
-            )
-            with urllib.request.urlopen(req, timeout=15, context=SSL) as response:
-                root = ET.fromstring(response.read())
             pages = []
             for obj in root.findall(".//ObjUrl"):
                 attrs = {str(node.text or "").strip().lower() for node in obj.findall("Attribute")}
+                category = str(obj.findtext("Category", "")).strip().lower()
                 url = obj.findtext("Url", "").strip()
-                if url and ("free resource" in attrs or "free" in attrs):
+                # PubMed LinkOut also returns patient-information and assay
+                # portals as "free resources". Only scholarly full-text links
+                # may be considered PDF candidates for this citation.
+                if url and category == "full text sources" and ("free resource" in attrs or "free" in attrs):
                     pages.append(url)
             for page in pages:
                 try:
@@ -301,13 +389,24 @@ class Harvester:
         def unpaywall():
             d = self.json(f"https://api.unpaywall.org/v2/{quoted}?email={self.email}")
             locs = ([d.get("best_oa_location")] if d.get("best_oa_location") else []) + (d.get("oa_locations") or [])
-            return [(x.get("url_for_pdf") or x.get("url"), "unpaywall") for x in locs if x]
+            return [(url, "unpaywall") for x in locs if x for url in (x.get("url_for_pdf"), x.get("url")) if url]
 
         def openalex():
             ident = urllib.parse.quote("https://doi.org/" + doi, safe="")
             d = self.json(f"https://api.openalex.org/works/{ident}?mailto={self.email}")
             locs = ([d.get("best_oa_location")] if d.get("best_oa_location") else []) + (d.get("locations") or [])
-            return [(x.get("pdf_url"), "openalex") for x in locs if x and x.get("pdf_url")]
+            return [(url, "openalex") for x in locs if x for url in (x.get("pdf_url"), x.get("landing_page_url")) if url]
+
+        def datacite():
+            d = self.json(f"https://api.datacite.org/dois/{quoted}")
+            attrs = d.get("data", {}).get("attributes", {})
+            out = []
+            if attrs.get("url"):
+                out.append((attrs["url"], "datacite"))
+            for value in attrs.get("contentUrl") or []:
+                if isinstance(value, str):
+                    out.append((value, "datacite"))
+            return out
 
         def europepmc():
             q = urllib.parse.urlencode({"query": f'DOI:"{doi}"', "format": "json", "pageSize": 3})
@@ -431,7 +530,7 @@ class Harvester:
         with cf.ThreadPoolExecutor(max_workers=12) as pool:
             futures = [pool.submit(fn) for fn in (
                 unpaywall, openalex, europepmc, crossref, openaire, doaj,
-                zenodo, hal, springer, semantic, core, ncbi_oa,
+                zenodo, hal, datacite, springer, semantic, core, ncbi_oa,
             )]
             for future in futures:
                 try:
@@ -475,18 +574,27 @@ class Harvester:
                 part.unlink(missing_ok=True)
         return ""
 
-    def download(self, url: str, target: Path) -> bool:
+    def download(self, url: str, target: Path, inspect_html: bool = True) -> bool:
         request = urllib.request.Request(url, headers={
             "User-Agent": self.ua, "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.2",
             "Referer": "https://doi.org/",
         })
         part = target.with_suffix(".part")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout, context=SSL) as response, part.open("wb") as out:
+            with urllib.request.urlopen(request, timeout=self.timeout, context=SSL) as response:
+                final_url = response.geturl()
+                content_type = response.headers.get("Content-Type", "").lower()
                 head = response.read(8192)
                 if not head.startswith(b"%PDF"):
+                    if inspect_html and ("html" in content_type or b"<html" in head.lower()):
+                        body = head + response.read(4 * 1024 * 1024 - len(head))
+                        candidates, _ = self.html_pdf_candidates(body, final_url)
+                        for candidate, _source in candidates:
+                            if candidate != final_url and self.download(candidate, target, inspect_html=False):
+                                return True
                     return False
-                out.write(head); shutil.copyfileobj(response, out, 262144)
+                with part.open("wb") as out:
+                    out.write(head); shutil.copyfileobj(response, out, 262144)
             if part.stat().st_size < 8000:
                 return False
             os.replace(part, target); return True
@@ -653,6 +761,9 @@ class Harvester:
         identifier = doi or f"pmid-{pmid}"
         target = self.output / safe_name(identifier)
         source = "cache" if target.exists() else ""
+        if not source and data.get("url"):
+            if self.download(str(data["url"]), target):
+                source = "zotero_url"
         if not source and doi:
             source = self.special_download(doi, target)
         if not source and doi:
@@ -672,6 +783,10 @@ class Harvester:
             candidates, discovered_doi = self.pmid_resolvers(pmid)
             doi = doi or discovered_doi
             for url, candidate_source in candidates:
+                if self.download(url, target):
+                    source = candidate_source; break
+        if not source:
+            for url, candidate_source in self.title_resolvers(str(data.get("title") or "")):
                 if self.download(url, target):
                     source = candidate_source; break
         if not source and doi and self.fallback(doi, target, fallback_timeout):

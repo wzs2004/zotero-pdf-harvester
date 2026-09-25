@@ -9,6 +9,7 @@
 - 直接读取一个或多个 Zotero 分类，不需要导出 CSV。
 - 并行查询 Unpaywall、OpenAlex、OpenAIRE、DOAJ、Zenodo、HAL、Europe PMC/PMC、Crossref、Semantic Scholar、NCBI OA；配置密钥后额外查询 CORE。
 - 对只有 PMID 的条目查询 PubMed 免费 LinkOut，并从期刊页的 `citation_pdf_url` 等标准元数据发现公开 PDF；DOI 条目也会尝试同一路径。
+- 自动遵守 NCBI 请求频率并重试临时限流，避免高并发时漏掉 PubMed LinkOut；可选配置 `NCBI_API_KEY` 提速。
 - 可选调用用户本人授权的 Elsevier TDM、Wiley TDM；只接受完整 `%PDF`，Elsevier 的“仅第一页”响应会被拒绝。
 - 自动调用 `fetchpdf` 做更广的开放获取兜底。
 - 可选 Playwright 机构浏览器兜底，复用本机登录状态处理有合法订阅权限的长尾出版商。
