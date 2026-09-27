@@ -319,8 +319,29 @@ class Harvester:
                         out.append((url, "hal_title"))
             return out
 
+        def arxiv_title():
+            # arXiv export API: only accept a near-exact title match, then use
+            # the canonical export.arxiv.org PDF URL.
+            query = urllib.parse.urlencode({"search_query": f"ti:\"{title}\"", "max_results": 5})
+            req = urllib.request.Request(
+                "https://export.arxiv.org/api/query?" + query,
+                headers={"User-Agent": self.ua, "Accept": "application/atom+xml"},
+            )
+            with urllib.request.urlopen(req, timeout=12, context=SSL) as response:
+                root = ET.fromstring(response.read())
+            out = []
+            for entry in root.findall("{http://www.w3.org/2005/Atom}entry"):
+                actual = entry.findtext("{http://www.w3.org/2005/Atom}title", "")
+                if not matches(actual):
+                    continue
+                ident = entry.findtext("{http://www.w3.org/2005/Atom}id", "").strip()
+                m = re.search(r"arxiv.org/abs/([^/?#]+)", ident)
+                if m:
+                    out.append((f"https://export.arxiv.org/pdf/{m.group(1)}.pdf", "arxiv"))
+            return out
+
         with cf.ThreadPoolExecutor(max_workers=3) as pool:
-            futures = [pool.submit(fn) for fn in (openalex_title, semantic_title, hal_title)]
+            futures = [pool.submit(fn) for fn in (openalex_title, semantic_title, hal_title, arxiv_title)]
             for future in futures:
                 try:
                     found.extend(future.result(timeout=12))
@@ -701,11 +722,30 @@ class Harvester:
                 )
                 page = context.pages[0] if context.pages else context.new_page()
                 page.set_default_timeout(max(15000, self.timeout * 1000))
+                # Keep the fallback single-page and prevent publisher scripts
+                # from spawning an unbounded chain of tabs/windows.
+                def close_popup(popup):
+                    try:
+                        popup.close()
+                    except Exception:
+                        pass
+                page.on("popup", close_popup)
                 for index, result in enumerate(pending, 1):
                     doi = result.get("doi") or ""
                     target = self.output / safe_name(doi)
                     try:
-                        page.goto(f"https://doi.org/{doi}", wait_until="domcontentloaded", timeout=60000)
+                        for extra in context.pages[1:]:
+                            try:
+                                extra.close()
+                            except Exception:
+                                pass
+                        # DOI and SSO providers can form redirect loops. Navigate
+                        # once with a strict hop/time budget and abandon this DOI
+                        # instead of opening more tabs or retrying indefinitely.
+                        page.goto(f"https://doi.org/{doi}", wait_until="domcontentloaded", timeout=30000)
+                        if len(page.url) > 2048 or page.url.lower().startswith(("about:blank", "data:")):
+                            result["browser_status"] = "invalid_redirect"
+                            continue
                         if any(word in page.url.lower() for word in auth_words):
                             print(f"需要学校登录；窗口将等待最多 {login_wait} 秒。", flush=True)
                             deadline = time.time() + login_wait
@@ -713,24 +753,68 @@ class Harvester:
                                 page.wait_for_timeout(2000)
                         info = classify_publisher(doi)
                         family = info.family if info else "unknown"
+                        def valid_pdf(body):
+                            return body.startswith(b"%PDF") and len(body) >= 1000
+
+                        def save_body(body):
+                            if valid_pdf(body):
+                                target.write_bytes(body)
+                                return True
+                            return False
+
+                        # First inspect all links, not just publisher-specific selectors.
+                        # Many sites expose a JS download button or a differently named PDF link.
+                        links = page.locator("a[href]")
+                        urls = []
+                        for n in range(min(links.count(), 300)):
+                            link = links.nth(n)
+                            href = link.get_attribute("href") or ""
+                            label = " ".join(filter(None, [
+                                link.inner_text(timeout=1000), link.get_attribute("aria-label"),
+                                link.get_attribute("title"), href,
+                            ])).lower()
+                            if href and any(word in label for word in ("pdf", "download", "fulltext", "article")):
+                                urls.append(urllib.parse.urljoin(page.url, href))
+                        # Keep configured selectors first, then generic link candidates.
                         selectors = list(PUBLISHER_PDF_SELECTORS.get(family, ())) + list(GENERIC_PDF_SELECTORS)
-                        locator = None
                         for selector in selectors:
                             candidate = page.locator(selector).first
-                            if candidate.count() and candidate.is_visible():
-                                locator = candidate
-                                break
-                        if locator is not None:
-                            href = locator.get_attribute("href")
-                            if href:
-                                url = urllib.parse.urljoin(page.url, href)
+                            if candidate.count():
+                                href = candidate.get_attribute("href") or ""
+                                if href:
+                                    urls.insert(0, urllib.parse.urljoin(page.url, href))
+                        seen = set()
+                        for url in urls:
+                            if url in seen or target.exists():
+                                continue
+                            seen.add(url)
+                            try:
                                 response = context.request.get(
                                     url, headers={"Accept": "application/pdf,*/*;q=0.8", "Referer": page.url},
-                                    timeout=max(30000, self.timeout * 1000),
+                                    timeout=max(30000, self.timeout * 1000), max_redirects=10,
                                 )
-                                body = response.body()
-                                if response.ok and body.startswith(b"%PDF") and len(body) >= 8000:
-                                    target.write_bytes(body)
+                                if response.ok and save_body(response.body()):
+                                    break
+                            except Exception:
+                                continue
+                        # Some publishers only emit the PDF after a click and return a
+                        # download event. Capture it without allowing popup chains.
+                        if not target.exists():
+                            for selector in selectors:
+                                try:
+                                    candidate = page.locator(selector).first
+                                    if not candidate.count() or not candidate.is_visible():
+                                        continue
+                                    with page.expect_download(timeout=5000) as pending_download:
+                                        candidate.click(timeout=5000)
+                                    download = pending_download.value
+                                    download.save_as(str(target))
+                                    if not valid_pdf(target.read_bytes()):
+                                        target.unlink(missing_ok=True)
+                                    if target.exists():
+                                        break
+                                except Exception:
+                                    continue
                         if target.exists() and target.read_bytes()[:5] == b"%PDF":
                             result.update(status="ready", source="institutional_browser", file=str(target))
                             self.attach(result)
